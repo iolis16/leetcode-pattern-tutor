@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>LeetCode Pattern Tutor</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <header>
+      <h1>LeetCode Pattern Tutor</h1>
+      <p class="subtitle">
+        Paste a problem statement. This won't give you the solution &mdash;
+        it identifies the algorithmic pattern and explains why, citing
+        similar problems as evidence.
+      </p>
+    </header>
+
+    <section class="input-section">
+      <textarea
+        id="problem-input"
+        placeholder="e.g. Given an array of integers, find the length of the longest subarray whose sum equals a target value..."
+        rows="8"
+      ></textarea>
+      <div class="controls">
+        <label for="k-select">Similar problems to retrieve:</label>
+        <select id="k-select">
+          <option value="3">3</option>
+          <option value="5" selected>5</option>
+          <option value="8">8</option>
+        </select>
+        <button id="analyze-btn">Analyze</button>
+      </div>
+    </section>
+
+    <section id="result-section" hidden>
+      <div id="error-box" class="error-box" hidden></div>
+
+      <div id="result-box" hidden>
+        <div class="patterns-row">
+          <div id="patterns" class="patterns"></div>
+          <span id="confidence" class="confidence"></span>
+        </div>
+
+        <h2>Reasoning</h2>
+        <p id="reasoning" class="reasoning"></p>
+
+        <h2>Retrieved similar problems</h2>
+        <ul id="retrieved-list" class="retrieved-list"></ul>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

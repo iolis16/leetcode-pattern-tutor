@@ -1,0 +1,97 @@
+"""
+Phase 3: given a new problem + retrieved similar problems, ask a local LLM
+(via Ollama) to identify the likely pattern(s) and explain why, citing the
+retrieved examples as evidence -- a tutor, not a solution generator.
+
+Runs entirely locally (no API key, no cost) using qwen3:latest, already
+pulled on this machine. Structured output is enforced via Ollama's
+grammar-constrained decoding (`format=<json schema>`), so the model cannot
+emit a response that violates PatternAnalysis's schema.
+
+Design note: the retrieved context sent to the model deliberately excludes
+`approach_notes` (title/tags/difficulty/statement only). approach_notes
+contains full solution code (see Phase 1/2 caveats in the README) -- rather
+than relying on a prompt instruction to stop the model from relaying that
+code, we just never put it in the context at all. Structurally safer than
+policing it after the fact.
+"""
+from typing import Literal
+
+import ollama
+from pydantic import BaseModel, Field
+
+from .retrieval import retrieve_similar
+
+MODEL = "qwen3:latest"
+
+SYSTEM_PROMPT = """\
+You are a tutor helping a student recognize algorithmic patterns in coding \
+interview problems (e.g. sliding window, two pointers, dynamic programming, \
+graph traversal, binary search, backtracking, union find).
+
+You will be given a new problem and a set of similar problems retrieved by \
+embedding similarity, each with its title, difficulty, and known pattern \
+tags. Your job:
+
+1. Identify which pattern(s) most likely apply to the new problem.
+2. Explain WHY, explicitly referencing the retrieved similar problems by \
+title as evidence -- e.g. "like 'Longest Substring Without Repeating \
+Characters', this problem asks for a contiguous run satisfying a \
+constraint, which is the signature of Sliding Window."
+3. Rate your confidence.
+
+Hard rule: you are a tutor, not a solution generator. Never output code, \
+pseudocode, or a step-by-step algorithm. Only identify the pattern and \
+explain the reasoning at a conceptual level. If the student wants the \
+actual solution, that's not your job.
+
+If the retrieved problems don't clearly support any pattern, say so plainly \
+in your reasoning and lower your confidence -- do not force a match.\
+"""
+
+
+class PatternAnalysis(BaseModel):
+    patterns: list[str] = Field(
+        description="Likely pattern(s), most likely first, e.g. ['Sliding Window', 'Hash Table']"
+    )
+    confidence: Literal["low", "medium", "high"]
+    reasoning: str = Field(
+        description="Explanation that references retrieved problems by title as evidence"
+    )
+    cited_problem_titles: list[str] = Field(
+        description="Titles of retrieved problems actually used as evidence, subset of what was retrieved"
+    )
+
+
+def build_user_message(problem_statement: str, retrieved: list[dict]) -> str:
+    context_blocks = []
+    for r in retrieved:
+        context_blocks.append(
+            f"- \"{r['title']}\" ({r['difficulty']}, tags: {', '.join(r['tags'])})\n"
+            f"  {r['problem_statement'][:400].strip()}"
+        )
+    context = "\n".join(context_blocks)
+
+    return (
+        f"New problem:\n{problem_statement}\n\n"
+        f"Retrieved similar problems (by embedding similarity):\n{context}"
+    )
+
+
+def generate_pattern_analysis(problem_statement: str, k: int = 5) -> tuple[PatternAnalysis, list[dict]]:
+    retrieved = retrieve_similar(problem_statement, k=k)
+    # Only title/difficulty/tags/statement reach the prompt -- see module docstring.
+    user_message = build_user_message(problem_statement, retrieved)
+
+    response = ollama.chat(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        format=PatternAnalysis.model_json_schema(),
+        think=True,
+        options={"temperature": 0.2},
+    )
+    analysis = PatternAnalysis.model_validate_json(response.message.content)
+    return analysis, retrieved
