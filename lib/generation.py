@@ -14,6 +14,14 @@ contains full solution code (see Phase 1/2 caveats in the README) -- rather
 than relying on a prompt instruction to stop the model from relaying that
 code, we just never put it in the context at all. Structurally safer than
 policing it after the fact.
+
+Phase 5 addition: an optional `allowed_patterns` vocabulary constrains the
+`patterns` field via a JSON-schema enum (still grammar-enforced, so the
+model literally cannot emit a tag outside the list) -- used by the eval
+script for clean, unambiguous scoring against ground-truth LeetCode tags.
+It's off by default so Phase 4's live UI keeps natural, unconstrained
+pattern names. `generate_pattern_analysis_baseline` is the no-retrieval
+comparison point for the same eval.
 """
 from typing import Literal
 
@@ -24,7 +32,7 @@ from .retrieval import retrieve_similar
 
 MODEL = "qwen3:latest"
 
-SYSTEM_PROMPT = """\
+RAG_SYSTEM_PROMPT = """\
 You are a tutor helping a student recognize algorithmic patterns in coding \
 interview problems (e.g. sliding window, two pointers, dynamic programming, \
 graph traversal, binary search, backtracking, union find).
@@ -49,6 +57,22 @@ If the retrieved problems don't clearly support any pattern, say so plainly \
 in your reasoning and lower your confidence -- do not force a match.\
 """
 
+BASELINE_SYSTEM_PROMPT = """\
+You are a tutor helping a student recognize algorithmic patterns in coding \
+interview problems (e.g. sliding window, two pointers, dynamic programming, \
+graph traversal, binary search, backtracking, union find).
+
+You will be given a new problem with no other context. Your job:
+
+1. Identify which pattern(s) most likely apply to the new problem.
+2. Explain your reasoning conceptually.
+3. Rate your confidence.
+
+Hard rule: you are a tutor, not a solution generator. Never output code, \
+pseudocode, or a step-by-step algorithm. Only identify the pattern and \
+explain the reasoning at a conceptual level.\
+"""
+
 
 class PatternAnalysis(BaseModel):
     patterns: list[str] = Field(
@@ -59,8 +83,23 @@ class PatternAnalysis(BaseModel):
         description="Explanation that references retrieved problems by title as evidence"
     )
     cited_problem_titles: list[str] = Field(
-        description="Titles of retrieved problems actually used as evidence, subset of what was retrieved"
+        default_factory=list,
+        description="Titles of retrieved problems actually used as evidence, subset of what was retrieved",
     )
+
+
+def build_output_schema(allowed_patterns: list[str] | None = None) -> dict:
+    schema = PatternAnalysis.model_json_schema()
+    # Cap array length -- an enum constrains which strings are legal but not
+    # how many, and a local model with no retrieved evidence to ground it
+    # can degenerate into cycling through the whole vocabulary with
+    # duplicates (observed: 31 items, repeats, 12 minutes to emit on this
+    # hardware). Real patterns lists are short and ranked; 5 is generous.
+    schema["properties"]["patterns"]["maxItems"] = 5
+    schema["properties"]["patterns"]["minItems"] = 1
+    if allowed_patterns:
+        schema["properties"]["patterns"]["items"] = {"type": "string", "enum": allowed_patterns}
+    return schema
 
 
 def build_user_message(problem_statement: str, retrieved: list[dict]) -> str:
@@ -78,7 +117,18 @@ def build_user_message(problem_statement: str, retrieved: list[dict]) -> str:
     )
 
 
-def generate_pattern_analysis(problem_statement: str, k: int = 5) -> tuple[PatternAnalysis, list[dict]]:
+def _vocabulary_note(allowed_patterns: list[str] | None) -> str:
+    if not allowed_patterns:
+        return ""
+    return (
+        "\n\nYou must choose `patterns` only from this exact vocabulary "
+        f"(pick the ones that apply, most likely first): {', '.join(allowed_patterns)}."
+    )
+
+
+def generate_pattern_analysis(
+    problem_statement: str, k: int = 5, allowed_patterns: list[str] | None = None
+) -> tuple[PatternAnalysis, list[dict]]:
     retrieved = retrieve_similar(problem_statement, k=k)
     # Only title/difficulty/tags/statement reach the prompt -- see module docstring.
     user_message = build_user_message(problem_statement, retrieved)
@@ -86,12 +136,29 @@ def generate_pattern_analysis(problem_statement: str, k: int = 5) -> tuple[Patte
     response = ollama.chat(
         model=MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": RAG_SYSTEM_PROMPT + _vocabulary_note(allowed_patterns)},
             {"role": "user", "content": user_message},
         ],
-        format=PatternAnalysis.model_json_schema(),
+        format=build_output_schema(allowed_patterns),
         think=True,
         options={"temperature": 0.2},
     )
     analysis = PatternAnalysis.model_validate_json(response.message.content)
     return analysis, retrieved
+
+
+def generate_pattern_analysis_baseline(
+    problem_statement: str, allowed_patterns: list[str] | None = None
+) -> PatternAnalysis:
+    """Phase 5 comparison point: same model, same output schema, no retrieval context."""
+    response = ollama.chat(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": BASELINE_SYSTEM_PROMPT + _vocabulary_note(allowed_patterns)},
+            {"role": "user", "content": f"New problem:\n{problem_statement}"},
+        ],
+        format=build_output_schema(allowed_patterns),
+        think=True,
+        options={"temperature": 0.2},
+    )
+    return PatternAnalysis.model_validate_json(response.message.content)

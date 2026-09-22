@@ -10,7 +10,7 @@ a tutor, not a solution generator.
 - [x] Phase 2 — Embedding + retrieval
 - [x] Phase 3 — Generation
 - [x] Phase 4 — API + frontend
-- [ ] Phase 5 — Evaluation
+- [x] Phase 5 — Evaluation
 - [ ] Phase 6 — Deploy + polish
 
 ## Phase 1: Data pipeline
@@ -174,6 +174,133 @@ HTML/CSS/JS and exercising the API directly with curl, not by clicking
 through it. The page was opened in the system browser
 (`open http://127.0.0.1:8000`) for manual visual confirmation.
 
+## Phase 5: Evaluation
+
+**Held-out test set.** The source dataset ships its own 228-problem `test`
+split. Those rows were **deleted from the Postgres corpus** (`DELETE FROM
+problems WHERE source_split = 'test'`) before this eval was written, so
+retrieval genuinely cannot find them or their near-duplicates — the corpus
+retrieval searches over is only the 2,641-problem `train` split. This
+matters: before the deletion, every "held-out" problem was already sitting
+in the vector index, so retrieval could trivially find itself. Evaluating
+on that setup would have measured memorization, not generalization.
+
+**Ground-truth vocabulary.** Rather than score against all 63 raw dataset
+tags, both the RAG and baseline conditions are constrained (via a JSON
+schema `enum`, grammar-enforced by Ollama — the model cannot emit a tag
+outside the list) to a curated 22-tag `PATTERN_TAGS` vocabulary in
+`scripts/08_evaluate.py`: Two Pointers, Sliding Window, Binary Search,
+DFS, BFS, Dynamic Programming, Greedy, Backtracking, Union Find,
+Topological Sort, Trie, Monotonic Stack, Monotonic Queue, Divide and
+Conquer, Memoization, Hash Table, Heap, Prefix Sum, Bit Manipulation,
+Sorting, Shortest Path, Recursion. Excluded: generic input-shape tags
+(Array, String, Matrix, Tree, Graph, Linked List — "Array" alone covers
+1,769/2,869 problems and would make the eval trivially easy without
+signaling any actual pattern recognition) and narrow domain tags (Math,
+Geometry, Number Theory, Game Theory, Brainteaser, Concurrency). This is a
+judgment call, documented here so it's defensible, not hidden.
+
+**Metrics**, computed per problem against ground truth filtered to
+`PATTERN_TAGS`: **top1** (is the model's first-ranked pattern correct?)
+and **any** (is any predicted pattern correct?) — ground truth is often
+multi-label (e.g. `["Sorting", "Trie"]`), so `any` is the more forgiving
+of the two.
+
+**Baseline.** `generate_pattern_analysis_baseline()` (added to
+`lib/generation.py`) calls the same model with the same output schema but
+*no retrieved context at all* — isolates what retrieval is actually
+contributing versus the LLM's own zero-shot judgment.
+
+**Sample size: n=10, not the planned n=30.** This is a real, honestly-reported
+constraint, not a stylistic choice — see "What went wrong" below.
+
+### Results
+
+| | top1 | any |
+|---|---|---|
+| **RAG** (retrieval + generation) | 50% | 50% |
+| **Baseline** (no retrieval) | 60% | 60% |
+
+**Baseline beat RAG on this sample.** Full per-problem breakdown in
+`data/eval/results.jsonl`; the pattern behind the 5-vs-6 split:
+
+| Problem | Ground truth | RAG | Baseline |
+|---|---|---|---|
+| Number Of Subsequences With Odd Sum | Dynamic Programming | hit | hit |
+| Final Array State After K Mult. Ops I | Heap | hit | hit |
+| Subsequences With A Unique Middle Mode II | Hash Table | miss | miss |
+| Max Area Rectangle With Point Constraints I | Sorting | miss | miss |
+| Sort Matrix By Diagonals | Sorting | hit | hit |
+| Report Spam Message | Hash Table | hit | hit |
+| Unique 3 Digit Even Numbers | Hash Table, Recursion | **hit** | miss |
+| Find Minimum Time To Reach Last Room II | Heap, Shortest Path | miss | **hit** |
+| Phone Number Prefix | Sorting, Trie | miss | **hit** |
+| Count Substrings That Satisfy K Constraint II | Binary Search, Prefix Sum, Sliding Window | miss | miss |
+
+Both conditions agree on 6 of 10 problems (4 shared hits, 2 shared misses).
+The entire result hinges on the 4 problems where they disagree: RAG won 1,
+baseline won 2. Honest read of why:
+
+- **n=10 is too small to draw a real conclusion.** A one-problem swing
+  flips the result. This is a directional signal, not a statistically
+  solid claim — see "What I'd do with more time" below.
+- **One RAG loss was a generation defect, not a retrieval failure.** On
+  "Find Minimum Time To Reach Last Room II," RAG's output was
+  `["Dynamic Programming", "Dynamic Programming", "Dynamic Programming",
+  "Dynamic Programming", "Dynamic Programming"]` — the same tag five
+  times. This is a residual bug (see below): bounding array length with
+  `maxItems` doesn't guarantee unique values, and the model degenerated
+  into repetition instead of committing to a ranked list.
+- **The hardest problem (3 ground-truth tags: Binary Search, Prefix Sum,
+  Sliding Window) stumped both conditions equally** — both scattered into
+  5 unrelated tags. Retrieval neither helped nor hurt there; the problem
+  was just hard for this model regardless of context.
+- On the 4 problems where retrieval had an unambiguous near-duplicate to
+  point to (e.g. a Sort-by-Diagonals-style problem retrieving an
+  actual sorting problem), RAG matched baseline exactly — it didn't
+  underperform on the "easy, clearly on-pattern" cases.
+
+**What went wrong (and was fixed) getting to n=10:**
+
+1. **Unbounded `patterns` array caused a 12-minute degenerate loop.** The
+   JSON schema's `enum` constrained *which* tags were legal but not *how
+   many* could appear. On the first real eval run, the baseline call for
+   one ambiguous problem emitted 31 items (repeating most of the 22-tag
+   vocabulary, some tags twice) and took 724 seconds. Fixed by adding
+   `maxItems: 5` / `minItems: 1` to the schema in `build_output_schema()`.
+   A residual quirk survived the fix, as shown above: `maxItems` bounds
+   length but not uniqueness, so a model can still fill the array with
+   duplicates of one tag. Worth a `uniqueItems: true` follow-up.
+2. **Killing a mid-request client wedged the Ollama server.** After
+   `pkill`-ing the degenerate first run, every subsequent call hung
+   indefinitely — `ollama ps` showed the model stuck in a `Stopping...`
+   state. Ollama was launched with a single generation slot (`-np 1`);
+   abandoning a request mid-stream appears to leave that slot orphaned
+   rather than cleanly freed. Fix: `ollama stop <model>` to force-unload
+   before retrying, every time a run is killed mid-request.
+3. **System memory pressure caused real (non-bug) stalls and recurred
+   twice.** Swap hit 86% full (79MB free RAM) mid-run, apparently from
+   the combination of this project's own processes (Postgres, a
+   redundant duplicate embedding-model load in a stale dev server that
+   should have been shut down, Ollama's 5.3GB model) plus a large number
+   of concurrent Chrome tabs unrelated to this project. `llama-server`
+   showed near-zero CPU progress over a 20-second window under pressure
+   — not hung, just thrashing. This was outside what should be silently
+   worked around (closing someone's browser tabs without asking is not
+   this project's call), so it was surfaced directly each time rather
+   than papered over. It was resolved once by the user freeing RAM, but
+   crept back up over the course of the run and contributed to stopping
+   at n=10 instead of the planned n=12.
+
+**What I'd do with more time:** run n=50-100 for a statistically solid
+number (needs either a faster local setup — disabling `think` mode,
+trying a smaller model — or moving generation to a hosted API for the eval
+run specifically, at a cost of a few dollars per Phase 3's cost-tradeoff
+discussion); add `uniqueItems: true` to the pattern schema; and inspect
+whether retrieval quality (not just presence) correlates with RAG wins —
+e.g. does RAG only help when the top retrieved result has very high
+similarity?
+
 ## Setup
 
 ```bash
@@ -193,4 +320,9 @@ ollama pull qwen3:latest                 # if not already present
 python3 scripts/07_generate_analysis.py  # full pipeline demo
 
 uvicorn app.main:app --reload            # http://127.0.0.1:8000
+
+# Phase 5: exclude the held-out test split from the retrieval corpus first
+# (see Phase 5 section for why this matters), then run the eval
+psql -h 127.0.0.1 -p 5433 -U postgres -d leetcode_tutor -c "DELETE FROM problems WHERE source_split = 'test';"
+python3 scripts/08_evaluate.py --n 30 --seed 42   # reduce --n if local latency is a problem
 ```

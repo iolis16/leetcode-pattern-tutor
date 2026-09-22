@@ -1,0 +1,9 @@
+{
+  "n": 10,
+  "seed": 42,
+  "note": "Stopped at n=10 of target n=12 due to recurring local memory-pressure stalls; see README Phase 5.",
+  "rag_top1_accuracy": 0.5,
+  "rag_any_accuracy": 0.5,
+  "baseline_top1_accuracy": 0.6,
+  "baseline_any_accuracy": 0.6
+}
