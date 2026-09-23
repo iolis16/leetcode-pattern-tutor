@@ -22,6 +22,19 @@ script for clean, unambiguous scoring against ground-truth LeetCode tags.
 It's off by default so Phase 4's live UI keeps natural, unconstrained
 pattern names. `generate_pattern_analysis_baseline` is the no-retrieval
 comparison point for the same eval.
+
+Known limitation, empirically verified (not assumed): Ollama's
+grammar-constrained decoding enforces `type`/`maxItems`/`minItems`/`enum`
+(these compile cleanly into a generation grammar -- each token choice only
+needs local context) but does NOT enforce `uniqueItems` (this requires
+tracking generation history across the whole array, which a
+context-free grammar can't express). Declaring `uniqueItems: true` in the
+schema is harmless but was confirmed to do nothing on its own -- re-ran the
+exact problem that produced 5x "Dynamic Programming" and got
+`["Dynamic Programming", "Breadth-First Search", "Dynamic Programming",
+"Dynamic Programming", "Dynamic Programming"]`, still repeating. The actual
+fix is `_dedupe_patterns()` below: deterministic post-processing, since
+distinctness can't be guaranteed at the decoding layer with this setup.
 """
 from typing import Literal
 
@@ -97,6 +110,10 @@ def build_output_schema(allowed_patterns: list[str] | None = None) -> dict:
     # hardware). Real patterns lists are short and ranked; 5 is generous.
     schema["properties"]["patterns"]["maxItems"] = 5
     schema["properties"]["patterns"]["minItems"] = 1
+    # Declared for documentation/future-compatibility, but Ollama's grammar
+    # decoder does not actually enforce this -- see module docstring.
+    # Real dedup happens in _dedupe_patterns() after parsing.
+    schema["properties"]["patterns"]["uniqueItems"] = True
     if allowed_patterns:
         schema["properties"]["patterns"]["items"] = {"type": "string", "enum": allowed_patterns}
     return schema
@@ -122,8 +139,19 @@ def _vocabulary_note(allowed_patterns: list[str] | None) -> str:
         return ""
     return (
         "\n\nYou must choose `patterns` only from this exact vocabulary "
-        f"(pick the ones that apply, most likely first): {', '.join(allowed_patterns)}."
+        f"(pick the ones that apply, most likely first): {', '.join(allowed_patterns)}. "
+        "List each pattern at most once -- do not repeat a pattern to fill space."
     )
+
+
+def _dedupe_patterns(analysis: PatternAnalysis) -> PatternAnalysis:
+    """The real uniqueness enforcement -- see module docstring. Preserves the
+    model's ranking (first occurrence order), just drops repeats."""
+    seen = []
+    for p in analysis.patterns:
+        if p not in seen:
+            seen.append(p)
+    return analysis.model_copy(update={"patterns": seen})
 
 
 def generate_pattern_analysis(
@@ -143,7 +171,7 @@ def generate_pattern_analysis(
         think=True,
         options={"temperature": 0.2},
     )
-    analysis = PatternAnalysis.model_validate_json(response.message.content)
+    analysis = _dedupe_patterns(PatternAnalysis.model_validate_json(response.message.content))
     return analysis, retrieved
 
 
@@ -161,4 +189,4 @@ def generate_pattern_analysis_baseline(
         think=True,
         options={"temperature": 0.2},
     )
-    return PatternAnalysis.model_validate_json(response.message.content)
+    return _dedupe_patterns(PatternAnalysis.model_validate_json(response.message.content))

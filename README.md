@@ -270,7 +270,27 @@ baseline won 2. Honest read of why:
    `maxItems: 5` / `minItems: 1` to the schema in `build_output_schema()`.
    A residual quirk survived the fix, as shown above: `maxItems` bounds
    length but not uniqueness, so a model can still fill the array with
-   duplicates of one tag. Worth a `uniqueItems: true` follow-up.
+   duplicates of one tag (e.g. the 5x "Dynamic Programming" case below).
+
+   **Follow-up, and a second empirical finding:** adding
+   `uniqueItems: true` to the schema was tried first and **did not work**
+   — re-ran the exact failing problem and got
+   `["Dynamic Programming", "Breadth-First Search", "Dynamic Programming",
+   "Dynamic Programming", "Dynamic Programming"]`, still repeating.
+   Ollama's grammar-constrained decoding enforces `type` / `maxItems` /
+   `minItems` / `enum` (these compile into a generation grammar cleanly —
+   each token choice only needs local context) but not `uniqueItems`,
+   which requires tracking the whole array's history, something a
+   context-free grammar can't express. The schema property is still
+   declared (harmless, and may work if Ollama's converter improves), but
+   the actual fix is `_dedupe_patterns()` in `lib/generation.py` —
+   deterministic post-processing after parsing, applied in both
+   `generate_pattern_analysis` and `generate_pattern_analysis_baseline`.
+   Verified with a plain unit test (no LLM call — the fix is pure Python,
+   so a live model re-run adds flakiness without adding confidence):
+   `["Dynamic Programming"]*5 → ["Dynamic Programming"]`,
+   `["DP","BFS","DP","DP","DP"] → ["DP","BFS"]`, ranking order preserved,
+   other fields untouched.
 2. **Killing a mid-request client wedged the Ollama server.** After
    `pkill`-ing the degenerate first run, every subsequent call hung
    indefinitely — `ollama ps` showed the model stuck in a `Stopping...`
