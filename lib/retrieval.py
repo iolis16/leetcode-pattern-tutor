@@ -5,6 +5,16 @@ API server) without depending on the numbered pipeline-script filenames.
 BGE's asymmetric convention: queries get a retrieval-instruction prefix,
 documents (already embedded in 04_embed_and_load.py) do not. Mismatching
 this measurably hurts retrieval quality for BGE models.
+
+Upgraded from bge-small (384-dim) to bge-base (768-dim) -- see README
+"Is there a way for RAG to beat baseline?" / lever #2. Manual tracing of
+Phase 5's RAG failures found the true bottleneck was retrieval RECALL: the
+correct pattern's tags weren't present anywhere in bge-small's top-15
+neighbors for the failing cases, at any rank -- re-ranking (lever #1)
+can't fix an answer that was never retrieved. A stronger embedding model
+was the direct next lever to test. `problems.embedding` is `vector(768)`
+to match; a full re-embed of the corpus is required after this change
+(old 384-dim vectors are not compatible/comparable with new 768-dim ones).
 """
 import os
 
@@ -15,7 +25,7 @@ from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
-MODEL_NAME = "BAAI/bge-small-en-v1.5"
+MODEL_NAME = "BAAI/bge-base-en-v1.5"
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 _model = None

@@ -1,0 +1,9 @@
+{
+  "n": 10,
+  "seed": 42,
+  "note": "RAG re-run with dedup + lever#1 (anti-anchoring tally) + lever#2 (bge-base embeddings); baseline reused unchanged from original n=10 run.",
+  "rag_top1_accuracy": 0.5,
+  "rag_any_accuracy": 0.6,
+  "baseline_top1_accuracy": 0.6,
+  "baseline_any_accuracy": 0.6
+}

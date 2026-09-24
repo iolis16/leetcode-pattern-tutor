@@ -35,7 +35,20 @@ exact problem that produced 5x "Dynamic Programming" and got
 "Dynamic Programming", "Dynamic Programming"]`, still repeating. The actual
 fix is `_dedupe_patterns()` below: deterministic post-processing, since
 distinctness can't be guaranteed at the decoding layer with this setup.
+
+Anti-anchoring addition (see README, "Is there a way for RAG to beat
+baseline?"): manual evidence tracing on Phase 5's failures showed RAG
+losing specifically when the single most-similar retrieved problem had
+the wrong tags (a lexically/topically similar but techniquely different
+neighbor outranked the actually-relevant one) -- the model followed that
+top-1 result's tags almost verbatim. `generate_pattern_analysis` now
+retrieves a wider pool (`wide_k`, default 15) purely to compute a
+tag-frequency tally across it, shown to the model alongside the same
+top-`k` individual snippets as before. The tally is a second, aggregate
+signal that doesn't depend on which single neighbor happened to rank
+first -- meant to reduce over-trusting one similar-but-wrong result.
 """
+from collections import Counter
 from typing import Literal
 
 import ollama
@@ -50,9 +63,10 @@ You are a tutor helping a student recognize algorithmic patterns in coding \
 interview problems (e.g. sliding window, two pointers, dynamic programming, \
 graph traversal, binary search, backtracking, union find).
 
-You will be given a new problem and a set of similar problems retrieved by \
-embedding similarity, each with its title, difficulty, and known pattern \
-tags. Your job:
+You will be given a new problem, a set of similar problems retrieved by \
+embedding similarity (with title, difficulty, and known pattern tags), and \
+a tag-frequency tally computed across a WIDER pool of similar problems \
+than the ones shown individually. Your job:
 
 1. Identify which pattern(s) most likely apply to the new problem.
 2. Explain WHY, explicitly referencing the retrieved similar problems by \
@@ -60,6 +74,14 @@ title as evidence -- e.g. "like 'Longest Substring Without Repeating \
 Characters', this problem asks for a contiguous run satisfying a \
 constraint, which is the signature of Sliding Window."
 3. Rate your confidence.
+
+Important: the single most-similar retrieved problem is not always the \
+most reliable evidence -- a problem can be topically or lexically similar \
+(same surface phrasing, same domain) while using a completely different \
+technique. Cross-check the top result against the tag-frequency tally: if \
+the tally points to a different pattern than the single most-similar \
+problem's tags, trust the broader tally over the one outlier, and say so \
+in your reasoning.
 
 Hard rule: you are a tutor, not a solution generator. Never output code, \
 pseudocode, or a step-by-step algorithm. Only identify the pattern and \
@@ -119,7 +141,24 @@ def build_output_schema(allowed_patterns: list[str] | None = None) -> dict:
     return schema
 
 
-def build_user_message(problem_statement: str, retrieved: list[dict]) -> str:
+def tag_frequency_summary(retrieved_wide: list[dict], allowed_patterns: list[str] | None = None) -> str:
+    counts = Counter()
+    for r in retrieved_wide:
+        for t in r["tags"]:
+            if allowed_patterns is None or t in allowed_patterns:
+                counts[t] += 1
+    if not counts:
+        return "(no consistent pattern tag appears across this wider pool)"
+    total = len(retrieved_wide)
+    return "\n".join(f"- {tag}: {count}/{total}" for tag, count in counts.most_common(10))
+
+
+def build_user_message(
+    problem_statement: str,
+    retrieved: list[dict],
+    retrieved_wide: list[dict] | None = None,
+    allowed_patterns: list[str] | None = None,
+) -> str:
     context_blocks = []
     for r in retrieved:
         context_blocks.append(
@@ -128,10 +167,21 @@ def build_user_message(problem_statement: str, retrieved: list[dict]) -> str:
         )
     context = "\n".join(context_blocks)
 
-    return (
+    message = (
         f"New problem:\n{problem_statement}\n\n"
         f"Retrieved similar problems (by embedding similarity):\n{context}"
     )
+
+    if retrieved_wide:
+        tally = tag_frequency_summary(retrieved_wide, allowed_patterns)
+        message += (
+            f"\n\nPattern tag frequency across the {len(retrieved_wide)} most similar "
+            f"problems (a wider pool than the ones detailed above -- use this to check "
+            f"whether the single most-similar problem's tags reflect the broader "
+            f"consensus, or are an outlier):\n{tally}"
+        )
+
+    return message
 
 
 def _vocabulary_note(allowed_patterns: list[str] | None) -> str:
@@ -155,11 +205,15 @@ def _dedupe_patterns(analysis: PatternAnalysis) -> PatternAnalysis:
 
 
 def generate_pattern_analysis(
-    problem_statement: str, k: int = 5, allowed_patterns: list[str] | None = None
+    problem_statement: str, k: int = 5, allowed_patterns: list[str] | None = None, wide_k: int = 15
 ) -> tuple[PatternAnalysis, list[dict]]:
-    retrieved = retrieve_similar(problem_statement, k=k)
+    # Retrieve the wider pool once (one embedding call, one DB round-trip),
+    # slice the top-k for individual citation -- same contract as before,
+    # `retrieved` returned to the caller is unchanged in shape and size.
+    retrieved_wide = retrieve_similar(problem_statement, k=max(k, wide_k))
+    retrieved = retrieved_wide[:k]
     # Only title/difficulty/tags/statement reach the prompt -- see module docstring.
-    user_message = build_user_message(problem_statement, retrieved)
+    user_message = build_user_message(problem_statement, retrieved, retrieved_wide, allowed_patterns)
 
     response = ollama.chat(
         model=MODEL,

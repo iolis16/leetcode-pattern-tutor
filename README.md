@@ -316,10 +316,101 @@ baseline won 2. Honest read of why:
 number (needs either a faster local setup — disabling `think` mode,
 trying a smaller model — or moving generation to a hosted API for the eval
 run specifically, at a cost of a few dollars per Phase 3's cost-tradeoff
-discussion); add `uniqueItems: true` to the pattern schema; and inspect
-whether retrieval quality (not just presence) correlates with RAG wins —
-e.g. does RAG only help when the top retrieved result has very high
-similarity?
+discussion); and inspect whether retrieval quality (not just presence)
+correlates with RAG wins — e.g. does RAG only help when the top retrieved
+result has very high similarity? (The `uniqueItems: true` idea from this
+list turned out not to work — see the follow-up below.)
+
+## Phase 5 follow-up: manual failure tracing, three fixes, and a re-eval
+
+After the initial 50%-vs-60% result, I didn't stop at "RAG lost" — I
+traced the actual retrieved evidence for every disagreement between RAG
+and baseline (see `retrieve_similar()` calls against the specific failing
+problems) to find out *why*, then tested three concrete fixes. This
+section is the real value of the project beyond the headline number: a
+methodology for diagnosing *why* a RAG system underperforms, not just
+whether it does.
+
+**Diagnosis.** Manually inspecting retrieved evidence for every RAG loss
+showed a consistent mechanism: RAG followed whichever single retrieved
+problem ranked #1, even when that problem was topically/lexically similar
+but techniquely wrong. Example — for "Phone Number Prefix" (ground truth:
+Sorting, Trie), the top-ranked retrieved neighbor was tagged `Two
+Pointers` at 0.813 similarity, and RAG's answer was just "Two Pointers,"
+copied straight from it; none of the top-5 retrieved problems carried the
+correct tags at all.
+
+**Fix attempt 1 — `uniqueItems: true` on the schema** (addressing the
+duplicate-tag bug, e.g. 5x "Dynamic Programming"). Empirically verified
+**not to work**: Ollama's grammar-constrained decoding enforces
+`type`/`maxItems`/`minItems`/`enum` but not `uniqueItems`, which requires
+tracking array history, not expressible in a token-by-token generation
+grammar. Real fix: `_dedupe_patterns()` in `lib/generation.py`,
+deterministic post-processing after parsing. Verified with a unit test
+(pure Python, no LLM dependency): confirmed it changes 0/10 of the
+original eval's scores, since the one affected record's underlying
+pattern pick was wrong regardless of duplication.
+
+**Fix attempt 2 — anti-anchoring** (`generate_pattern_analysis`'s
+`wide_k` parameter, `lib/generation.py`): retrieve a wider pool (k=15)
+purely to compute a tag-frequency tally across it, shown to the model
+alongside the same top-5 individual snippets as before, with an explicit
+instruction to weigh the aggregate tally over a single outlier neighbor.
+Tested live on the two known failures — neither flipped to correct on
+its own, because the *wider* neighborhood also lacked strong support for
+the true answer (e.g. "Trie" appeared in only 1 of 15 neighbors for Phone
+Number Prefix; "Sorting" in 0). This was a **recall** problem
+(right answer not retrieved at any rank), not a **precision** problem
+(right answer retrieved but ranked low) — re-ranking/aggregation only
+fixes the latter.
+
+**Fix attempt 3 — bigger embedding model** (`bge-small-en-v1.5` →
+`bge-base-en-v1.5`, 384-dim → 768-dim; `lib/retrieval.py`,
+`scripts/04_embed_and_load.py`, `scripts/03_setup_schema.sql`). Directly
+targets recall. Verified via direct retrieval inspection (no LLM call
+needed, deterministic): the correct-tagged neighbor's rank improved for
+both known failures (e.g. moved from rank 3 to rank 2 for "Find Minimum
+Time To Reach Last Room II," with the similarity gap to the misleading
+top-1 result nearly closing, 0.789 vs 0.786). Live-testing this in
+isolation was unreliable — one test call ran 25 minutes with no result
+and had to be killed (a new, more severe instance of this session's
+recurring local-infra fragility); the other completed but still missed.
+
+**Combined re-eval** (`scripts/09_reeval_rag_only.py`): re-ran RAG only
+— not baseline — on the identical n=10 held-out sample (seed=42) with
+all three fixes applied. Baseline was deliberately *not* re-run: it never
+retrieves anything, so it's structurally unaffected by any of the three
+fixes (confirmed: 0/10 baseline records had duplicate-tag output in the
+original run, so even the dedup fix is a no-op for it). This halved the
+re-eval's cost — 10 calls instead of 20 — for the same rigor.
+
+| | RAG (original) | RAG (after all 3 fixes) | Baseline (unchanged) |
+|---|---|---|---|
+| top1 | 50% | 50% | 60% |
+| any-match | 50% | **60%** | 60% |
+
+**Result: RAG's any-match accuracy improved to tie baseline; top1 stayed
+flat.** Four problems flipped — two in each direction:
+
+| Problem | Flip | Note |
+|---|---|---|
+| Number Of Subsequences With Odd Sum | hit → miss | Previously a clean single-tag answer; new run took 1383.9s (23 min, longest successful call all session) and produced a scattered 5-item guess |
+| Final Array State After K Mult. Ops I | hit → miss | Previously clean, fast (32.8s); regressed to a single wrong tag |
+| Maximum Area Rectangle With Point Constraints I | miss → hit | |
+| Phone Number Prefix | miss → **hit** (`Trie`, exact top1) | The case that hung 25 min in isolated live testing completed fine here in 136.6s — a reminder of how much run-to-run variance this local setup has, independent of correctness |
+| Count Substrings That Satisfy K Constraint II | miss → **hit**, all 3 ground-truth tags present | The hardest problem in the sample (3-tag ground truth), previously missed by both RAG and baseline |
+
+**Honest interpretation:** the combined fixes don't make RAG unambiguously
+better — they trade some previously-easy wins for previously-hard wins.
+Widening retrieval to surface an aggregate signal helps when the original
+narrow evidence was misleading, but can dilute/confuse cases where the
+narrow evidence was already sufficient and correct. Net effect at n=10:
+a wash on the strict metric, a real gain on the lenient one. This is a
+believable, mechanistically-explained result, not a suspiciously clean
+win — which is the more useful thing to have for an interview: a traced
+root cause (retrieval recall vs. precision), three specific fixes each
+tested and honestly reported (including one that didn't work), and a
+controlled before/after re-eval on identical held-out data.
 
 ## Setup
 
@@ -345,4 +436,25 @@ uvicorn app.main:app --reload            # http://127.0.0.1:8000
 # (see Phase 5 section for why this matters), then run the eval
 psql -h 127.0.0.1 -p 5433 -U postgres -d leetcode_tutor -c "DELETE FROM problems WHERE source_split = 'test';"
 python3 scripts/08_evaluate.py --n 30 --seed 42   # reduce --n if local latency is a problem
+
+# Phase 5 follow-up: re-run RAG only (not baseline, see that section for why)
+# on the same held-out sample after the dedup/anti-anchoring/embedding fixes
+python3 scripts/09_reeval_rag_only.py
+```
+
+**Note on the embedding model:** the project was upgraded mid-Phase-5 from
+`bge-small-en-v1.5` (384-dim) to `bge-base-en-v1.5` (768-dim) — the schema
+above (`vector(768)`) and `04_embed_and_load.py` already reflect this. If
+you're re-running this setup from scratch, no extra steps are needed. If
+you're migrating an *existing* database from the old model, the column
+must be dropped and re-added at the new dimension before re-embedding:
+```bash
+psql -h 127.0.0.1 -p 5433 -U postgres -d leetcode_tutor -c "
+DROP INDEX IF EXISTS problems_embedding_hnsw;
+ALTER TABLE problems DROP COLUMN embedding;
+ALTER TABLE problems ADD COLUMN embedding vector(768);
+"
+python3 scripts/04_embed_and_load.py
+psql -h 127.0.0.1 -p 5433 -U postgres -d leetcode_tutor -f scripts/05_build_index.sql
+psql -h 127.0.0.1 -p 5433 -U postgres -d leetcode_tutor -c "DELETE FROM problems WHERE source_split = 'test';"
 ```

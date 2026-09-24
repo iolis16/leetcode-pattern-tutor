@@ -1,11 +1,19 @@
 """
-Phase 2: embed every normalized problem with bge-small-en-v1.5 and load
+Phase 2: embed every normalized problem with bge-base-en-v1.5 and load
 problem + embedding into Postgres (pgvector).
 
 BGE models are trained with an asymmetric convention: documents are embedded
 as-is, but queries should be prefixed with an instruction. We follow that
 here so retrieval quality matches how the model was trained -- see
-`query_prefix` in 06_retrieve.py for the query-side counterpart.
+`query_prefix` in lib/retrieval.py for the query-side counterpart.
+
+Upgraded from bge-small (384-dim) to bge-base (768-dim) -- see
+lib/retrieval.py docstring and README "Is there a way for RAG to beat
+baseline?" for why. Running this script re-embeds and upserts every
+problem; run scripts/05_build_index.sql again afterward (the HNSW index
+must be rebuilt for the new vector(768) column), and if you'd already
+excluded the held-out test split (Phase 5), re-run that DELETE too --
+this script upserts every row in problems.jsonl, test split included.
 """
 import json
 import os
@@ -20,7 +28,7 @@ from tqdm import tqdm
 load_dotenv()
 
 PROCESSED_DIR = Path(__file__).parent.parent / "data" / "processed"
-MODEL_NAME = "BAAI/bge-small-en-v1.5"
+MODEL_NAME = "BAAI/bge-base-en-v1.5"
 BATCH_SIZE = 64
 
 
